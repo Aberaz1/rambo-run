@@ -1,0 +1,486 @@
+/*
+  ============================================================
+                          RAMBO RUN
+  ============================================================
+  A Chrome-dinosaur style runner for:
+    - Arduino Nano V3
+    - HC-SR04 ultrasonic sensor
+    - SSD1306 128x64 I2C OLED
+
+  HOW TO PLAY
+    Wave your hand over the sensor to START.
+    Wave again to make Rambo JUMP over the cacti.
+    Watch out for BIRDS: don't jump, and they fly over you.
+    Hit anything and it's GAME OVER.
+    Wave again to RESTART.
+
+  WIRING
+    OLED     VCC -> 5V    GND -> GND   SDA -> A4   SCL -> A5
+    HC-SR04  VCC -> 5V    GND -> GND   TRIG -> D9  ECHO -> D10
+
+  LIBRARIES (install from Tools > Manage Libraries)
+    "Adafruit SSD1306" and "Adafruit GFX Library"
+  ============================================================
+*/
+
+#include <Wire.h>
+#include <EEPROM.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- Settings you can tweak ----------------
+const int   WAVE_DISTANCE_CM = 15;    // hand closer than this counts as a wave
+const float JUMP_POWER       = 5.2;   // bigger number = higher jump
+const float GRAVITY          = 0.45;  // bigger number = Rambo falls faster
+const float START_SPEED      = 3.0;   // how fast the world scrolls at the start
+const float MAX_SPEED        = 5.5;   // the game never goes faster than this
+const int   FRAME_MS         = 30;    // time per frame (30 ms is about 33 fps)
+const int   BIRD_START_SCORE = 100;   // birds start appearing at this score
+const int   BIRD_CHANCE      = 30;    // % chance each new obstacle is a bird
+
+// ---------------- Pins ----------------
+const int TRIG_PIN = 9;
+const int ECHO_PIN = 10;
+
+// ---------------- Screen ----------------
+const int SCREEN_W = 128;
+const int SCREEN_H = 64;
+const int GROUND_Y = 60;              // y position of the ground line
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+// ---------------- Rambo sprites (24 x 24 pixels) ----------------
+// Each row is 3 bytes (24 pixels). A 1 bit is a lit pixel.
+// Two frames that swap to make Rambo look like he is running.
+const unsigned char PROGMEM ramboRun1[] = {
+  0x00, 0x18, 0x00,  // ...........##...........   antenna
+  0x00, 0x18, 0x00,  // ...........##...........
+  0x03, 0xBD, 0xC0,  // ......###.####.###......   top of the wool
+  0x6F, 0xFF, 0xF6,  // .##.################.##.   horns start
+  0xEF, 0xFF, 0xF7,  // ###.################.###
+  0xAC, 0x00, 0x35,  // #.#.##............##.#.#
+  0xEC, 0xFF, 0x37,  // ###.##..########..##.###   face starts
+  0xCD, 0xBD, 0xB3,  // ##..##.##.####.##.##..##   eyes
+  0x8D, 0xBD, 0xB1,  // #...##.##.####.##.##...#   eyes
+  0x1D, 0xDB, 0xB8,  // ...###.###.##.###.###...   smile
+  0x1D, 0xE7, 0xB8,  // ...###.####..####.###...   smile
+  0x0C, 0xFF, 0x30,  // ....##..########..##....
+  0x1C, 0x00, 0x38,  // ...###............###...
+  0x0F, 0xFF, 0xF0,  // ....################....
+  0x07, 0xBD, 0xE0,  // .....####.####.####.....   bottom of the wool
+  0x00, 0x7E, 0x00,  // .........######.........
+  0x0E, 0xFF, 0x70,  // ....###.########.###....   arms
+  0x1E, 0xDB, 0x78,  // ...####.##.##.##.####...   belly emblem
+  0x0E, 0xE7, 0x70,  // ....###.###..###.###....
+  0x00, 0xFF, 0x00,  // ........########........
+  0x00, 0x7E, 0x00,  // .........######.........
+  0x00, 0xE7, 0x00,  // ........###..###........   legs apart
+  0x01, 0xC3, 0x80,  // .......###....###.......
+  0x03, 0x81, 0xC0   // ......###......###......
+};
+
+const unsigned char PROGMEM ramboRun2[] = {
+  0x00, 0x18, 0x00,
+  0x00, 0x18, 0x00,
+  0x03, 0xBD, 0xC0,
+  0x6F, 0xFF, 0xF6,
+  0xEF, 0xFF, 0xF7,
+  0xAC, 0x00, 0x35,
+  0xEC, 0xFF, 0x37,
+  0xCD, 0xBD, 0xB3,
+  0x8D, 0xBD, 0xB1,
+  0x1D, 0xDB, 0xB8,
+  0x1D, 0xE7, 0xB8,
+  0x0C, 0xFF, 0x30,
+  0x1C, 0x00, 0x38,
+  0x0F, 0xFF, 0xF0,
+  0x07, 0xBD, 0xE0,
+  0x00, 0x7E, 0x00,
+  0x00, 0xFF, 0x00,  // ........########........
+  0x0E, 0xDB, 0x70,  // ....###.##.##.##.###....   arms swing down
+  0x1E, 0xE7, 0x78,  // ...####.###..###.####...
+  0x0E, 0xFF, 0x70,  // ....###.########.###....
+  0x00, 0x7E, 0x00,  // .........######.........
+  0x00, 0x66, 0x00,  // .........##..##.........   legs together
+  0x00, 0x66, 0x00,  // .........##..##.........
+  0x00, 0xE7, 0x00   // ........###..###........
+};
+
+// ---------------- Bird sprites (16 x 10 pixels) ----------------
+// Each row is 2 bytes (16 pixels). The bird faces left, towards Rambo.
+const unsigned char PROGMEM birdUp[] = {
+  0x02, 0x00,  // ......#.........   wing up
+  0x03, 0x00,  // ......##........
+  0x03, 0x80,  // ......###.......
+  0x33, 0xC0,  // ..##..####......   head
+  0x6F, 0xFF,  // .##.############   eye and tail
+  0xFF, 0xFC,  // ##############..   beak and body
+  0x0F, 0xF0,  // ....########....
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00
+};
+
+const unsigned char PROGMEM birdDown[] = {
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x30, 0x00,  // ..##............   head
+  0x6F, 0xFF,  // .##.############
+  0xFF, 0xFC,  // ##############..
+  0x0F, 0xF0,  // ....########....
+  0x03, 0xC0,  // ......####......   wing down
+  0x03, 0x80,  // ......###.......
+  0x02, 0x00   // ......#.........
+};
+
+const int BIRD_W = 16;
+const int BIRD_H = 10;
+const int BIRD_Y = 22;   // high enough to miss Rambo on the ground, low enough to hit him mid-jump
+
+// ---------------- Rambo ----------------
+const int   RAMBO_X        = 10;            // Rambo stays at this x position
+const int   RAMBO_SIZE     = 24;            // sprite is 24 x 24 pixels
+const float RAMBO_GROUND_Y = GROUND_Y - RAMBO_SIZE; // y of Rambo's top when standing
+
+float ramboY;
+float ramboVelocity;
+bool  onGround;
+byte  jumpBuffer;   // remembers a wave for a few frames so jumps feel responsive
+
+// ---------------- Obstacles (cacti and birds) ----------------
+const int MAX_OBSTACLES = 3;
+const int CACTUS_W      = 10;
+
+enum ObstacleType { SMALL_CACTUS, TALL_CACTUS, BIRD };
+
+struct Obstacle {
+  float        x;
+  ObstacleType type;
+  bool         active;   // is it on screen?
+};
+Obstacle obstacles[MAX_OBSTACLES];
+float distToNextObstacle;
+
+// ---------------- Game state ----------------
+enum GameState { TITLE, PLAYING, GAME_OVER };
+GameState state = TITLE;
+
+float speed;
+float distance;
+float groundOffset;
+unsigned int  score;
+unsigned int  highScore;
+unsigned long frameCount;
+unsigned long lastFrame;
+unsigned long gameOverTime;
+byte nearCount;     // how many readings in a row the hand has been close
+
+
+// ============================================================
+//                    ULTRASONIC SENSOR
+// ============================================================
+
+// Returns distance in cm, or 999 if nothing is in front of the sensor.
+int readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Wait at most 6 ms for the echo (about 1 m) so the game doesn't freeze
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 6000UL);
+  if (duration == 0) return 999;
+  return duration / 58;
+}
+
+// Returns true ONCE each time a hand moves in close to the sensor.
+// The hand must be close for 2 readings in a row (ignores random glitches),
+// and it must move away again before another wave counts.
+bool checkWave() {
+  if (readDistanceCm() < WAVE_DISTANCE_CM) {
+    if (nearCount < 255) nearCount++;
+  } else {
+    nearCount = 0;
+  }
+  return nearCount == 2;
+}
+
+
+// ============================================================
+//                       DRAWING
+// ============================================================
+
+int cactusHeight(ObstacleType type) {
+  return (type == TALL_CACTUS) ? 18 : 12;
+}
+
+void drawCactus(int x, int h) {
+  int top = GROUND_Y - h;
+  display.fillRect(x + 3, top,     4, h, WHITE);  // trunk
+  display.fillRect(x,     top + 4, 2, 5, WHITE);  // left arm going up
+  display.fillRect(x,     top + 8, 4, 2, WHITE);  // left arm joining trunk
+  display.fillRect(x + 8, top + 2, 2, 5, WHITE);  // right arm going up
+  display.fillRect(x + 6, top + 6, 4, 2, WHITE);  // right arm joining trunk
+}
+
+void drawBird(int x) {
+  // Flap the wings every 6 frames
+  const unsigned char* sprite = ((frameCount / 6) % 2 == 0) ? birdUp : birdDown;
+  display.drawBitmap(x, BIRD_Y, sprite, BIRD_W, BIRD_H, WHITE);
+}
+
+void drawWorld() {
+  // Ground line with little stones that scroll past
+  display.drawFastHLine(0, GROUND_Y, SCREEN_W, WHITE);
+  for (int i = 0; i < SCREEN_W + 16; i += 16) {
+    int x = i - (int)groundOffset;
+    display.drawPixel(x + 3,  GROUND_Y + 2, WHITE);
+    display.drawPixel(x + 11, GROUND_Y + 3, WHITE);
+  }
+
+  // Cacti and birds
+  for (int i = 0; i < MAX_OBSTACLES; i++) {
+    if (!obstacles[i].active) continue;
+    if (obstacles[i].type == BIRD) {
+      drawBird((int)obstacles[i].x);
+    } else {
+      drawCactus((int)obstacles[i].x, cactusHeight(obstacles[i].type));
+    }
+  }
+
+  // Rambo: swap frames every 4 frames while running, freeze mid-air
+  const unsigned char* sprite = ramboRun1;
+  if (onGround && (frameCount / 4) % 2 == 1) sprite = ramboRun2;
+  display.drawBitmap(RAMBO_X, (int)ramboY, sprite, RAMBO_SIZE, RAMBO_SIZE, WHITE);
+
+  // Score (left) and high score (right)
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.print(score);
+  display.setCursor(74, 0);
+  display.print(F("HI "));
+  display.print(highScore);
+}
+
+void drawTitleScreen() {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(10, 1);
+  display.print(F("RAMBO RUN"));
+
+  display.drawBitmap(52, 18, ramboRun1, RAMBO_SIZE, RAMBO_SIZE, WHITE);
+  display.drawFastHLine(0, 42, SCREEN_W, WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(22, 46);
+  display.print(F("Wave to start!"));
+  display.setCursor(40, 56);
+  display.print(F("HI: "));
+  display.print(highScore);
+
+  display.display();
+}
+
+
+// ============================================================
+//                       GAME LOGIC
+// ============================================================
+
+void startGame() {
+  ramboY        = RAMBO_GROUND_Y;
+  ramboVelocity = 0;
+  onGround      = true;
+  jumpBuffer    = 0;
+
+  speed        = START_SPEED;
+  distance     = 0;
+  score        = 0;
+  frameCount   = 0;
+  groundOffset = 0;
+
+  for (int i = 0; i < MAX_OBSTACLES; i++) obstacles[i].active = false;
+  distToNextObstacle = 60;   // first cactus shows up quickly
+
+  state = PLAYING;
+}
+
+void spawnObstacle() {
+  for (int i = 0; i < MAX_OBSTACLES; i++) {
+    if (!obstacles[i].active) {
+      obstacles[i].x = SCREEN_W;
+      obstacles[i].active = true;
+
+      if (score >= BIRD_START_SCORE && random(100) < BIRD_CHANCE) {
+        obstacles[i].type = BIRD;
+      } else if (random(3) == 0) {
+        obstacles[i].type = TALL_CACTUS;    // 1 in 3 cacti is a tall one
+      } else {
+        obstacles[i].type = SMALL_CACTUS;
+      }
+      return;
+    }
+  }
+}
+
+void updateGame() {
+  frameCount++;
+
+  // ----- Jumping and gravity -----
+  if (jumpBuffer > 0) jumpBuffer--;
+  if (onGround && jumpBuffer > 0) {
+    ramboVelocity = -JUMP_POWER;   // negative = upwards on the screen
+    onGround = false;
+    jumpBuffer = 0;
+  }
+  if (!onGround) {
+    ramboVelocity += GRAVITY;
+    ramboY += ramboVelocity;
+    if (ramboY >= RAMBO_GROUND_Y) {   // landed
+      ramboY = RAMBO_GROUND_Y;
+      ramboVelocity = 0;
+      onGround = true;
+    }
+  }
+
+  // ----- Move obstacles left, remove ones that went off screen -----
+  for (int i = 0; i < MAX_OBSTACLES; i++) {
+    if (obstacles[i].active) {
+      obstacles[i].x -= speed;
+      if (obstacles[i].x < -BIRD_W) obstacles[i].active = false;
+    }
+  }
+
+  // ----- Add new obstacles with a random gap (always big enough to react) -----
+  distToNextObstacle -= speed;
+  if (distToNextObstacle <= 0) {
+    spawnObstacle();
+    distToNextObstacle = random((long)(speed * 32), (long)(speed * 55));
+  }
+
+  // ----- Scroll the ground -----
+  groundOffset += speed;
+  if (groundOffset >= 16) groundOffset -= 16;
+
+  // ----- Score goes up with distance, and the game speeds up -----
+  distance += speed;
+  score = (unsigned int)(distance / 10);
+  speed = START_SPEED + score / 150.0;
+  if (speed > MAX_SPEED) speed = MAX_SPEED;
+}
+
+// Checks if Rambo's box overlaps any obstacle's box.
+// The boxes are a little smaller than the drawings so near misses feel fair
+// (Rambo's horns and antenna, and the bird's wing tips, don't count as hits).
+bool hitObstacle() {
+  int rx = RAMBO_X + 5;
+  int ry = (int)ramboY + 3;
+  int rw = 14;
+  int rh = 20;
+
+  for (int i = 0; i < MAX_OBSTACLES; i++) {
+    if (!obstacles[i].active) continue;
+
+    int ox, oy, ow, oh;
+    if (obstacles[i].type == BIRD) {
+      ox = (int)obstacles[i].x + 1;
+      oy = BIRD_Y + 2;
+      ow = BIRD_W - 2;
+      oh = 6;
+    } else {
+      int h = cactusHeight(obstacles[i].type);
+      ox = (int)obstacles[i].x + 1;
+      oy = GROUND_Y - h + 1;
+      ow = CACTUS_W - 2;
+      oh = h - 1;
+    }
+
+    if (rx < ox + ow && rx + rw > ox && ry < oy + oh && ry + rh > oy) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void gameOver() {
+  state = GAME_OVER;
+  gameOverTime = millis();
+
+  bool newBest = score > highScore;
+  if (newBest) {
+    highScore = score;
+    EEPROM.put(0, highScore);   // saved even when the Nano is unplugged
+  }
+
+  // Show the final scene with a message box on top
+  display.clearDisplay();
+  drawWorld();
+  display.fillRect(14, 15, 100, 37, BLACK);
+  display.drawRect(14, 15, 100, 37, WHITE);
+
+  display.setCursor(37, 19);
+  display.print(F("GAME OVER"));
+  display.setCursor(newBest ? 22 : 34, 30);
+  display.print(newBest ? F("NEW BEST! ") : F("SCORE: "));
+  display.print(score);
+  display.setCursor(19, 41);
+  display.print(F("Wave to restart"));
+
+  display.display();
+}
+
+
+// ============================================================
+//                    SETUP AND MAIN LOOP
+// ============================================================
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // If the screen isn't found, blink the Nano's LED forever
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    pinMode(LED_BUILTIN, OUTPUT);
+    while (true) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(200);
+    }
+  }
+
+  randomSeed(analogRead(A0));   // makes obstacle gaps different every game
+
+  EEPROM.get(0, highScore);
+  if (highScore == 0xFFFF) highScore = 0;   // brand new Nano has 0xFFFF stored
+
+  drawTitleScreen();
+}
+
+void loop() {
+  // Run one frame every FRAME_MS milliseconds
+  if (millis() - lastFrame < FRAME_MS) return;
+  lastFrame = millis();
+
+  bool wave = checkWave();
+
+  if (state == TITLE) {
+    if (wave) startGame();
+  }
+  else if (state == PLAYING) {
+    if (wave) jumpBuffer = 6;   // jump now, or as soon as Rambo lands
+    updateGame();
+    if (hitObstacle()) {
+      gameOver();
+    } else {
+      display.clearDisplay();
+      drawWorld();
+      display.display();
+    }
+  }
+  else if (state == GAME_OVER) {
+    // Short pause so a wave at the moment of the crash doesn't restart instantly
+    if (wave && millis() - gameOverTime > 800) startGame();
+  }
+}
