@@ -450,6 +450,8 @@ void setup() {
     }
   }
 
+  display.setRotation(2);
+
   randomSeed(analogRead(A0));   // makes obstacle gaps different every game
 
   EEPROM.get(0, highScore);
