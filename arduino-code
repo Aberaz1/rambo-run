@@ -450,7 +450,7 @@ void setup() {
     }
   }
 
-  display.setRotation(2);
+  display.setRotation(2);  // Flips the oled display 180 degrees
 
   randomSeed(analogRead(A0));   // makes obstacle gaps different every game
 
